@@ -111,7 +111,7 @@ export function UseCases() {
   );
 }
 
-export function CallToAction() {
+export function CallToAction({ signedIn }: { signedIn: boolean }) {
   return (
     <section className="border-t border-line">
       <div className="mx-auto flex w-full max-w-6xl flex-col items-center px-6 py-28 text-center">
@@ -119,13 +119,14 @@ export function CallToAction() {
           Ask a question. <em className="text-accent">Watch</em> it get answered.
         </h2>
         <p className="mt-6 max-w-xl text-lg leading-relaxed text-muted">
-          Open the console, type what you want to know, and follow each agent as it works.
+          Add your documents and repositories, type what you want to know, and follow each agent as
+          it works.
         </p>
         <Link
-          href="/console"
+          href={signedIn ? "/console" : "/signup"}
           className="mt-10 rounded-full bg-accent px-7 py-3.5 font-subheading text-sm font-medium text-background transition-opacity hover:opacity-85"
         >
-          Open the console
+          {signedIn ? "Open the console" : "Create your account"}
         </Link>
       </div>
     </section>

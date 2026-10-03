@@ -1,137 +1,273 @@
-# AgentOS Architecture
+# AgentLens Architecture
 
-AgentOS is a web application: a Next.js frontend talking to a FastAPI backend that runs a
-LangGraph multi-agent workflow. Product scope is in [AgentOS_README.md](../AgentOS_README.md);
-this document covers how the code is organised and why.
+AgentLens (repo and Python package are still named AgentOS/`agentos`) is a web application: a
+Next.js frontend talking to a FastAPI backend that runs a LangGraph multi-agent workflow over
+the user's documents, uploaded codebases and GitHub repositories. Product scope is in
+[AgentOS_README.md](../AgentOS_README.md); this document covers how it is built and why.
 
 ## Status
 
-A walking skeleton is in place: the web UI starts a run, the API executes the LangGraph
-workflow and streams each agent's result back, and the UI renders the execution trace and
-report. **All seven agents are stubs** that return placeholder data. No LLM, retrieval, MCP,
-database tables or auth exist yet. See [Build order](#build-order).
+Built and working:
+
+- **Accounts.** Sign up, log in, log out. Everything except health and auth needs a session.
+- **Sources.** Upload documents, upload a codebase zip, connect a GitHub repository.
+- **Indexing.** Uploads are chunked, embedded and stored in Qdrant in the background.
+- **Agents.** All seven agents are implemented and run as one LangGraph workflow that streams
+  to the browser.
+- **Answers.** A Markdown report with citations, a per-claim verification list, the evidence
+  used, and time and token counts per agent.
+
+How it has been verified is in [Verification](#verification).
+
+Not built: human approval for write actions, conversation memory, run history, Ragas
+evaluation, Langfuse tracing, Dockerfiles. See [Not built](#not-built).
 
 ## System overview
 
 ```text
  Browser
-    │  HTTPS (REST + Server-Sent Events)
+    │  REST + Server-Sent Events, session cookie
     ▼
-┌──────────────┐        ┌───────────────────────────────────────────┐
-│  apps/web    │        │  apps/api                                 │
-│  Next.js     │ ─────► │  FastAPI  ──►  LangGraph workflow         │
-│  (UI only)   │        │     │            planner → rag ─────────┐ │
-└──────────────┘        │     │                    → github →     │ │
-                        │     │                      code_analysis┤ │
-                        │     │            analyst ◄──────────────┘ │
-                        │     │            → verifier → report      │
-                        │     ▼                                     │
-                        │  Celery tasks (ingestion, indexing, evals)│
-                        └──────┬───────────────┬──────────────┬─────┘
-                               ▼               ▼              ▼
-                          PostgreSQL        Qdrant          Redis
-                        (app data, run    (embeddings)   (Celery broker)
-                         checkpoints)
-                                                    GitHub MCP server
-                                                    LLM provider
+┌──────────────┐        ┌──────────────────────────────────────────────────┐
+│  apps/web    │        │  apps/api (FastAPI)                              │
+│  Next.js     │ ─────► │   auth · sources · runs                          │
+│  (UI only)   │        │        │                    │                    │
+└──────────────┘        │        ▼                    ▼                    │
+                        │   indexing job        LangGraph workflow         │
+                        │   chunk → embed       planner → rag ─────┐       │
+                        │   → Qdrant                    → github ──┤       │
+                        │                       code_analysis ◄────┘       │
+                        │                       → analyst → verifier       │
+                        │                       → report                   │
+                        └───┬──────────┬──────────────┬─────────────┬──────┘
+                            ▼          ▼              ▼             ▼
+                         SQLite/    Qdrant        LLM (Gemini)   GitHub MCP
+                         Postgres   (vectors)                    server
 ```
+
+## The agent pipeline
+
+One question runs through seven agents. They share a single state object
+(`agents/state.py`); each agent reads what it needs and adds its results.
+
+| # | Agent | What it does | Model calls |
+|---|---|---|---|
+| 1 | **Planner** | Reads the question and the list of the user's sources. Produces a task list, 1–4 knowledge-base search queries, which connected repositories the question concerns, and 1–4 things to find in them. | 1 |
+| 2a | **RAG** | Searches the user's indexed uploads (see [Retrieval](#retrieval)). Returns the top 8 chunks as evidence `S1…S8`. Skipped if nothing is indexed. | 0 |
+| 2b | **GitHub** | For each repository the planner selected (up to 3), runs a tool-calling loop over the GitHub MCP server's read-only tools: list directories, read files, search code, read commits, issues and PRs. The model requests several tools per turn; at most 3 turns and 10 tool calls per repository. Each tool result becomes evidence `G1…`. | up to 3 per repo |
+| 3 | **Code Analysis** | Reads the code evidence from both branches and explains components, responsibilities, call relationships and data flow, citing ids. Skipped if there is no code. | 1 |
+| 4 | **Analyst** | Turns all evidence into a summary, a list of claims (each a single checkable statement with the evidence ids that support it) and a list of gaps. | 1 |
+| 5 | **Verifier** | Checks every claim against the evidence it cites. Marks each `verified` or `needs_review` with a reason. A claim citing an id that does not exist is rejected in code without asking the model. | 1 |
+| 6 | **Report** | Writes the Markdown report from verified claims only. Unverified claims go under "Unverified"; gaps go under "Not Determined". | 1 |
+
+2a and 2b run in parallel; Code Analysis waits for both.
+
+Two parts of the report are generated by code, not by the model, so they cannot be invented:
+**Source References** (built from the evidence the verified claims actually cite) and
+**Agent Execution Summary** (measured time and token usage per agent).
+
+If no evidence is found at all, agents 3–6 make no model calls and the report says why (no
+sources, sources still indexing, or a repository that could not be reached).
+
+Failures are contained: if the GitHub agent cannot reach a repository, or the model fails
+partway through its investigation, the evidence already gathered is kept, the failure becomes
+a warning in the trace and the report, and the run continues.
+
+**Request budget.** A run over one repository makes at most 8 model requests (measured: 7).
+This matters on Gemini's free tier, where `gemini-3.6-flash` allows 20 requests per day —
+about two runs. `github_max_turns` in `core/config.py` is the main lever.
+
+### What the browser receives
+
+`POST /api/v1/runs/stream` returns Server-Sent Events, one per finished agent:
+
+| Event | Meaning |
+|---|---|
+| `{"type": "node", "node", "detail", "metrics", "warnings"}` | an agent finished. `detail` holds its results (plan, evidence references, claims, report). |
+| `{"type": "done"}` | the workflow completed |
+| `{"type": "error", "message"}` | the workflow failed, e.g. no LLM key or a provider error |
+
+Evidence *text* is never streamed, only its id, source and location. User ids and GitHub
+tokens travel in the run's private config, not in the shared state, so they cannot leak into
+the stream. The contract lives in `api/routes/runs.py` and `web/src/lib/types.ts`; change
+both together.
+
+## Retrieval
+
+**Indexing** (`rag/ingest.py`, runs in the background after an upload):
+
+1. **Load.** PDFs page by page; Markdown, text and reStructuredText as text; codebase zips
+   file by file, straight from the archive.
+2. **Filter** (codebases). Skips dependency and build folders (`node_modules`, `.git`,
+   `dist`, `.venv`…), lock files, files over 1 MB, binary files and unknown extensions.
+3. **Chunk.** About 1,500 characters with 150 overlap, split on language-aware boundaries
+   (functions, classes, headings) for 20+ languages. Each chunk keeps its file path and line
+   range, or page number.
+4. **Embed.** A dense vector (`BAAI/bge-small-en-v1.5`, 384 dimensions) and a sparse BM25
+   vector per chunk. Both models run locally.
+5. **Store** in Qdrant with payload `user_id, source_id, source_name, kind, path, language,
+   start_line, end_line, page, text`.
+
+A source's status goes `pending → indexing → ready | failed` and the UI polls until it
+settles. Failed sources can be retried. Uploads left unfinished by a restart are re-queued at
+startup. Deleting a source deletes its vectors.
+
+**Search** (`rag/retrieval.py`, per run):
+
+1. For the question and each planner query: dense search and BM25 search in Qdrant, both
+   filtered to the user's own chunks, fused with **Reciprocal Rank Fusion**.
+2. The result lists are interleaved and the best 24 candidates are **reranked** by a
+   cross-encoder (`Xenova/ms-marco-MiniLM-L-6-v2`) against the original question.
+3. The top 8 become evidence.
+
+Every search is filtered by `user_id`, so one user can never retrieve another's content.
+
+## Technology stack
+
+| Layer | Technology |
+|---|---|
+| Frontend | Next.js 16 (App Router), React 19, TypeScript, Tailwind CSS 4, react-markdown |
+| Backend | Python 3.12, FastAPI, Pydantic, uv |
+| Agent orchestration | LangGraph |
+| LLM framework | LangChain (`init_chat_model`, structured output, tool calling, text splitters) |
+| LLM | Gemini via `langchain-google-genai`; provider and model set by `AGENTOS_LLM_MODEL` |
+| Agent tools | MCP Python SDK → GitHub's remote MCP server, read-only |
+| Vector database | Qdrant (embedded by default; server or Cloud by setting a URL) |
+| Retrieval | Dense + BM25 hybrid search, Reciprocal Rank Fusion, cross-encoder reranking |
+| Embeddings & reranker | fastembed (ONNX on CPU, no API key) |
+| Database | SQLAlchemy async; SQLite by default, PostgreSQL by setting a URL |
+| Auth | Argon2 password hashing, signed JWT in an HttpOnly cookie, Fernet-encrypted tokens |
+| Background jobs | In-process asyncio by default; Celery + Redis when `AGENTOS_USE_CELERY=true` |
+| Document parsing | pypdf |
+| Tests | pytest, ruff |
 
 ## Repository layout
 
 ```text
 apps/
-  web/                    Next.js 16 (App Router, TypeScript, Tailwind 4), pnpm
-    src/app/              routes: / (AgentLens landing page), /console (run UI)
-    src/app/layout.tsx    Google Fonts, one per role (heading, subheading, body, mono)
-    src/components/       landing/ sections; run-console.tsx = query box, trace, report
-    src/lib/api.ts        the only place that calls the backend
-    src/lib/types.ts      API event types shared across the UI
-  api/                    Python 3.12, uv-managed, package name `agentos`
+  web/                    Next.js frontend
+    src/app/              routes: / (landing), /login, /signup, /console (signed-in only)
+    src/components/       landing/, auth-form, sources-panel, run-console
+    src/lib/api.ts        the only place the browser calls the backend
+    src/lib/session.ts    server-side session checks
+    src/lib/validation.ts email, password, repository and upload rules
+    src/lib/types.ts      API types shared across the UI
+  api/                    Python backend, package name `agentos`
     src/agentos/
-      main.py             FastAPI app factory
+      main.py             FastAPI app; creates tables and resumes indexing at startup
       core/config.py      settings from AGENTOS_* env vars
-      api/                HTTP layer: router.py + routes/ (health, runs)
-      agents/             LangGraph: state.py, graph.py, nodes/<agent>.py
-      rag/                ingestion, embeddings, hybrid retrieval, reranking   (empty)
-      mcp/                GitHub MCP client + custom MCP servers               (empty)
-      llm/                provider-agnostic model factories                    (empty)
-      db/                 SQLAlchemy async engine/session, models
-      workers/            Celery app and tasks
+      core/security.py    password rules and hashing, session tokens, secret encryption
+      api/                router.py, deps.py (current user), routes/ (health, auth,
+                          sources, runs)
+      agents/             state.py, graph.py, common.py (metrics, evidence formatting),
+                          nodes/<agent>.py (one file per agent, prompt included)
+      llm/                the two functions agents use to call the model
+      rag/                chunking, embeddings, store (Qdrant), retrieval, ingest
+      mcp/github.py       GitHub MCP session, tool listing, tool calls
+      db/                 engine/session, models (User, Source)
+      workers/            Celery app and the indexing task
     tests/
 infra/
-  docker-compose.yml      Postgres, Redis, Qdrant for local development
+  docker-compose.yml      Postgres, Redis, Qdrant (all optional today)
 docs/
 ```
 
 Dependency direction inside `agentos`: `api` → `agents` → `rag` / `mcp` / `llm` → `db` / `core`.
-Routes stay thin; agents never import from `api`.
 
 ## Key decisions
 
-**Two apps, not one.** The frontend is Next.js and the AI stack (LangChain, LangGraph, Ragas)
-is Python, so the backend is a separate FastAPI service rather than Next.js route handlers.
-Next.js is UI only and holds no business logic.
+**Two apps.** The AI stack is Python, so the backend is a separate FastAPI service and
+Next.js is UI only.
 
-**Browser calls the API directly.** `apps/web` reads `NEXT_PUBLIC_API_URL` and the API allows
-that origin through CORS (`AGENTOS_CORS_ORIGINS`). This avoids proxying long-lived streams
-through the Next.js server.
+**Runs execute inside the API process and stream over SSE.** They are I/O-bound and the user
+is watching, so there is no queue in between.
 
-**Runs stream over Server-Sent Events.** `POST /api/v1/runs/stream` returns a
-`text/event-stream`; each frame is one JSON event:
+**Local retrieval models.** Embedding, BM25 and reranking run on the API machine through
+fastembed. Indexing a codebase therefore costs nothing and is not rate limited, and the only
+key the system needs is for the LLM. The trade-off is CPU time: reranking takes about 5
+seconds per question, and the first use downloads roughly 200 MB of models.
 
-| Event | Meaning |
-|---|---|
-| `{"type": "node", "node": "<agent>", "update": {...}}` | an agent finished; `update` is its state change |
-| `{"type": "done"}` | the workflow completed |
-| `{"type": "error", "message": "..."}` | the workflow failed mid-stream |
+**Embedded Qdrant by default.** With no `AGENTOS_QDRANT_URL`, Qdrant runs inside the API and
+stores data under `storage/qdrant`, so nothing else needs to be running. Embedded mode allows
+one process only; set a URL before running a second API process or a Celery worker.
 
-SSE fits because the flow is one-way (server → browser) and it works over plain HTTP. The
-contract is defined in `api/routes/runs.py` and mirrored in `web/src/lib/types.ts`; change
-both together.
+**Agents call the model through two functions** (`llm.structured`, `llm.chat`). The provider
+is chosen in one place, and tests replace exactly those two functions.
 
-**One LangGraph graph with shared state.** `agents/state.py` defines `AgentState`; each agent
-is a module in `agents/nodes/` exposing `async def run(state)` and returning a partial update.
-`agents/graph.py` is the only place that knows the wiring. RAG and GitHub branches run in
-parallel, and the analyst waits for both.
+**Claims are the unit of verification.** The analyst must output discrete claims with cited
+evidence ids, which is what makes the verifier's job checkable and lets the report separate
+verified from unverified statements.
 
-**Agent runs in the API process, heavy jobs in Celery.** Agent runs are I/O-bound and need to
-stream, so they run as async tasks inside FastAPI. Repository ingestion, embedding and
-evaluation are slow batch jobs and go to Celery workers via Redis.
+**GitHub access is read-only twice over.** The MCP session is opened with the server's
+read-only header and limited toolsets, and tools not marked read-only are filtered out
+client-side. Against the live server this yields 22 tools, none write-capable.
 
-## Planned, not built
+## Authentication
 
-- **Persistence and resumable runs.** Runs currently live only for the duration of the HTTP
-  request. Next step is `runs` tables in Postgres plus LangGraph's Postgres checkpointer, so a
-  run has an ID, survives a dropped connection, and can be resumed.
-- **Human-in-the-loop.** Built on the checkpointer: write-capable tools call LangGraph
-  `interrupt()`, the stream emits an approval event, and a `POST /runs/{id}/resume` endpoint
-  continues the run.
-- **Data model.** Workspace → repositories and documents → runs → run events. Qdrant payloads
-  carry `workspace`, `repository`, `file`, `language`, `branch` for filtered retrieval.
-- **Auth.** Undecided. Every table and Qdrant filter should be workspace-scoped from the start
-  so auth can be added without a data migration.
-- **Observability and evaluation.** Langfuse callbacks on the graph; Ragas runs as Celery tasks.
-- **Deployment.** Dockerfiles for `web` and `api` and a production compose file are not written.
+- **Accounts.** Email and password. Emails are stored lowercased with a unique constraint.
+  Passwords need 8+ characters with lowercase, uppercase, number and special character, and
+  are hashed with Argon2.
+- **Validation runs twice.** Regexes in the browser for instant feedback
+  (`web/src/lib/validation.ts`); the API enforces the same rules and is the source of truth.
+- **Sessions.** `agentlens_session`, an HttpOnly, SameSite=Lax cookie holding a signed token
+  valid for 7 days.
+- **Gating.** `/console` redirects to `/login` without a valid session. The API enforces it
+  independently on `runs` and `sources`.
+- **Deployment constraint.** Web and API must share a site (e.g. `app.example.com` and
+  `api.example.com`). Locally use `localhost` for both, not `127.0.0.1` for one of them.
 
-## Build order
+## Sources
 
-1. Database models + Alembic migrations; persist runs and events.
-2. `llm/` factory (Gemini by default) and a real planner agent.
-3. `rag/`: ingestion task → Qdrant → hybrid retrieval → RAG agent.
-4. `mcp/`: GitHub MCP client → GitHub and code-analysis agents.
-5. Analyst, verifier and report agents with citations.
-6. Checkpointer, resumable runs, human approval.
-7. Auth and workspaces, Langfuse, Ragas, Dockerfiles.
+- **Uploads.** Streamed to `AGENTOS_STORAGE_DIR/<user id>/<source id>.<ext>` with size limits
+  (25 MB documents, 100 MB codebases). Documents: `.pdf .md .markdown .txt .rst`. Codebases:
+  a real zip with no path-traversal entries and bounded extracted size.
+- **GitHub.** `owner/repo` plus a personal access token. The token is verified by reading the
+  repository through the MCP server, then stored encrypted with a key derived from
+  `AGENTOS_SECRET_KEY`. GitHub repositories are not indexed; agents read them live.
+
+## Database
+
+SQLite file by default (`apps/api/agentos.db`); set `AGENTOS_DATABASE_URL` for Postgres
+(untested). Tables are created at startup, and new nullable or defaulted columns are added
+to existing tables automatically. Any other schema change needs a migration tool; add Alembic
+before the first deployment.
+
+## Verification
+
+- **49 backend tests.** They run the real graph, real chunking, real Qdrant hybrid search
+  (in memory), verification rules and report assembly, with the chat model, the embedding
+  models and the GitHub server replaced by fakes.
+- **Real retrieval models.** This project's own source was indexed (148 chunks from 57 files)
+  and searched with the real embedding, BM25 and reranker models; the expected files came
+  back for each test question, another user saw nothing, and deletion removed the vectors.
+- **Live GitHub MCP server.** Tool listing, a directory listing, a file read and a failed
+  read were exercised against a connected repository.
+- **Browser.** Upload, background indexing status, a failed upload, a full run with real
+  retrieval and a canned model, Markdown rendering and the verification panel.
+- **Real LLM.** One full run against a connected repository on `gemini-3.5-flash-lite`:
+  27 seconds, 7 model requests, 6 of 6 claims verified, correct cited report. On
+  `gemini-3.6-flash` only single calls and the GitHub tool loop were exercised before the
+  free-tier daily quota ran out. The RAG branch has not been run together with a real LLM.
+
+## Not built
+
+- **Human-in-the-loop.** Agents are read-only, so nothing needs approval yet. Write actions
+  would need LangGraph's checkpointer, an interrupt, and a resume endpoint.
+- **Memory and history.** Each run is independent; runs are not stored.
+- **Evaluation and observability.** No Ragas metrics or Langfuse tracing. Time and token
+  usage per agent are measured and shown.
+- **Custom MCP servers** (README §5). AgentLens consumes GitHub's MCP server but does not
+  expose its own.
+- **Account features.** Email verification, password reset, login rate limiting.
+- **Deployment.** No Dockerfiles or production compose file.
 
 ## Running locally
 
 ```sh
-# backing services (not needed for the current stub pipeline)
-docker compose -f infra/docker-compose.yml up -d
-
 # API — http://localhost:8000/docs
 cd apps/api
 uv sync
+# put your key in apps/api/.env:  AGENTOS_LLM_API_KEY=...
 uv run fastapi dev src/agentos/main.py
 
 # Web — http://localhost:3000

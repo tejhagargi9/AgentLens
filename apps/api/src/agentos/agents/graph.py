@@ -16,7 +16,7 @@ from agentos.agents.state import AgentState
 
 
 def build_graph() -> CompiledStateGraph:
-    """planner -> (rag | github -> code_analysis) -> analyst -> verifier -> report"""
+    """planner -> (rag | github) -> code_analysis -> analyst -> verifier -> report"""
     graph = StateGraph(AgentState)
 
     graph.add_node("planner", planner.run)
@@ -30,9 +30,9 @@ def build_graph() -> CompiledStateGraph:
     graph.add_edge(START, "planner")
     graph.add_edge("planner", "rag")
     graph.add_edge("planner", "github")
-    graph.add_edge("github", "code_analysis")
-    # The analyst waits for both evidence branches before it runs.
-    graph.add_edge(["rag", "code_analysis"], "analyst")
+    # Code analysis waits for both evidence branches: it reads code from uploads and GitHub.
+    graph.add_edge(["rag", "github"], "code_analysis")
+    graph.add_edge("code_analysis", "analyst")
     graph.add_edge("analyst", "verifier")
     graph.add_edge("verifier", "report")
     graph.add_edge("report", END)

@@ -10,7 +10,11 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 
-# node (apps/web has its own .gitignore for Next.js output)
+# api local data (SQLite database, uploaded files)
+apps/api/*.db
+apps/api/storage/
+
+# node(apps/web has its own .gitignore for Next.js output)
 node_modules/
 
 # editors / OS

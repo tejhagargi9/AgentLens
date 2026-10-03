@@ -58,7 +58,7 @@ function ExampleRun() {
   );
 }
 
-export function Hero() {
+export function Hero({ signedIn }: { signedIn: boolean }) {
   return (
     <section className="relative overflow-hidden">
       {/* Lens: soft glow plus concentric rings behind the headline. */}
@@ -91,10 +91,10 @@ export function Hero() {
         </p>
         <div className="mt-10 flex flex-wrap items-center justify-center gap-3">
           <Link
-            href="/console"
+            href={signedIn ? "/console" : "/signup"}
             className="rounded-full bg-accent px-6 py-3 font-subheading text-sm font-medium text-background transition-opacity hover:opacity-85"
           >
-            Open the console
+            {signedIn ? "Open the console" : "Get started"}
           </Link>
           <a
             href="#how"

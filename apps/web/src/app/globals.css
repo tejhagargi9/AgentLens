@@ -51,6 +51,100 @@
   }
 }
 
+/* Rendered Markdown of the final report. */
+.report {
+  font-size: 0.9375rem;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+
+.report h2 {
+  margin: 2rem 0 0.75rem;
+  font-size: 1.75rem;
+  line-height: 1.2;
+}
+
+.report h2:first-child {
+  margin-top: 0;
+}
+
+.report h3 {
+  margin: 1.5rem 0 0.5rem;
+  font-size: 1.05rem;
+}
+
+.report p,
+.report ul,
+.report ol,
+.report table,
+.report pre {
+  margin: 0.75rem 0;
+}
+
+.report ul,
+.report ol {
+  padding-left: 1.4rem;
+}
+
+.report ul {
+  list-style: disc;
+}
+
+.report ol {
+  list-style: decimal;
+}
+
+.report li {
+  margin: 0.3rem 0;
+}
+
+.report a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.report code {
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  background: rgb(255 255 255 / 0.07);
+  border-radius: 0.3rem;
+  padding: 0.1rem 0.35rem;
+}
+
+.report pre {
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: 0.6rem;
+  background: var(--background);
+  padding: 0.9rem 1rem;
+}
+
+.report pre code {
+  background: none;
+  padding: 0;
+}
+
+.report table {
+  display: block;
+  overflow-x: auto;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+
+.report th,
+.report td {
+  border: 1px solid var(--line);
+  padding: 0.4rem 0.75rem;
+  text-align: left;
+}
+
+.report th {
+  font-family: var(--font-subheading);
+  font-weight: 500;
+  color: var(--muted);
+}
+
 @keyframes trace-in {
   from {
     opacity: 0;
