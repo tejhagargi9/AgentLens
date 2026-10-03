@@ -1,0 +1,75 @@
+@import "tailwindcss";
+
+:root {
+  --background: #0a0b0d;
+  --surface: #111317;
+  --foreground: #edece7;
+  --muted: #9b9da3;
+  --line: rgb(255 255 255 / 0.1);
+  --accent: #c5f277;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-surface: var(--surface);
+  --color-foreground: var(--foreground);
+  --color-muted: var(--muted);
+  --color-line: var(--line);
+  --color-accent: var(--accent);
+
+  /* Typography roles — the fonts themselves are loaded in app/layout.tsx. */
+  --font-heading: var(--font-instrument-serif);
+  --font-subheading: var(--font-space-grotesk);
+  --font-sans: var(--font-inter);
+  --font-mono: var(--font-jetbrains-mono);
+}
+
+@layer base {
+  html {
+    color-scheme: dark;
+    scroll-behavior: smooth;
+  }
+
+  body {
+    background: var(--background);
+    color: var(--foreground);
+    font-family: var(--font-sans);
+  }
+
+  h1,
+  h2 {
+    font-family: var(--font-heading);
+    font-weight: 400;
+    letter-spacing: -0.01em;
+  }
+
+  h3,
+  h4 {
+    font-family: var(--font-subheading);
+    font-weight: 500;
+    letter-spacing: -0.01em;
+  }
+}
+
+@keyframes trace-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+}
+
+/* Staggered reveal for the hero's example run; set --i per item. */
+.trace-step {
+  animation: trace-in 0.5s ease-out both;
+  animation-delay: calc(var(--i) * 160ms + 300ms);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+
+  .trace-step {
+    animation: none;
+  }
+}
